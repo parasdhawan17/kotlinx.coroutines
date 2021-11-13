@@ -9,14 +9,9 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 import kotlinx.coroutines.internal.*
-import kotlinx.coroutines.intrinsics.*
 import kotlinx.coroutines.sync.*
 import kotlin.contracts.*
 import kotlin.coroutines.*
-import kotlin.coroutines.intrinsics.*
-import kotlin.jvm.*
-import kotlin.native.concurrent.*
-import kotlin.time.*
 
 /**
  * Waits for the result of multiple suspending functions simultaneously, which are specified using _clauses_
@@ -59,7 +54,7 @@ public suspend inline fun <R> select(crossinline builder: SelectBuilder<R>.() ->
     contract {
         callsInPlace(builder, InvocationKind.EXACTLY_ONCE)
     }
-    return SelectBuilderImpl<R>().run {
+    return SelectImplementation<R>().run {
         prepare()
         builder(this)
         doSelect()
@@ -100,26 +95,32 @@ public interface SelectBuilder<in R> {
      * @param timeMillis timeout time in milliseconds.
      */
     @ExperimentalCoroutinesApi
-    public fun onTimeout(timeMillis: Long, block: suspend () -> R)
+    @Deprecated(message = "Replaced with the same extension function",
+                level = DeprecationLevel.HIDDEN, replaceWith = ReplaceWith("onTimeout"))
+    public fun onTimeout(timeMillis: Long, block: suspend () -> R): Unit = onTimeout(timeMillis, block)
 }
 
 /**
- * Clause that selects the given [block] after the specified [timeout] passes.
- * If timeout is negative or zero, [block] is selected immediately.
- *
- * **Note: This is an experimental api.** It may be replaced with light-weight timer/timeout channels in the future.
+ * Each [select] clause should be provided with:
+ * 1) the [object of this clause][objForSelect],
+ *    such as the channel instance for `onSend` and `onReceive`;
+ * 2) the function that specifies how this clause
+ *    should be registered in the object above ([regFunc]);
+ * 3) the function that modifies the resumption result
+ *    (passed via [SelectInstance.trySelect]) to the argument
+ *    of the user-specified block.
  */
-@ExperimentalCoroutinesApi
-@ExperimentalTime
-public fun <R> SelectBuilder<R>.onTimeout(timeout: Duration, block: suspend () -> R): Unit =
-    onTimeout(timeout.toDelayMillis(), block)
-
 @InternalCoroutinesApi
 public sealed interface SelectClause {
     public val objForSelect: Any
     public val regFunc: RegistrationFunction
     public val processResFunc: ProcessResultFunction
 }
+
+@InternalCoroutinesApi
+public typealias RegistrationFunction = (objForSelect: Any, select: SelectInstance<*>, param: Any?) -> Unit
+@InternalCoroutinesApi
+public typealias ProcessResultFunction = (objForSelect: Any, param: Any?, clauseResult: Any?) -> Any?
 
 /**
  * Clause for [select] expression without additional parameters that does not select any value.
@@ -131,8 +132,9 @@ public class SelectClause0Impl(
     override val objForSelect: Any,
     override val regFunc: RegistrationFunction
 ) :  SelectClause0 {
-    override val processResFunc: ProcessResultFunction = { objForSelect: Any, param: Any?, clauseResult: Any? -> clauseResult }
+    override val processResFunc: ProcessResultFunction = DUMMY_PROCESS_RESULT_FUNCTION
 }
+private val DUMMY_PROCESS_RESULT_FUNCTION: ProcessResultFunction = { _, _, _ -> null }
 
 /**
  * Clause for [select] expression without additional parameters that selects value of type [Q].
@@ -157,12 +159,6 @@ public class SelectClause2Impl<P, Q>(
     override val regFunc: RegistrationFunction,
     override val processResFunc: ProcessResultFunction
 ) : SelectClause2<P, Q>
-@InternalCoroutinesApi
-public typealias RegistrationFunction = (objForSelect: Any, select: SelectInstance<*>, param: Any?) -> Unit
-@InternalCoroutinesApi
-public typealias ProcessResultFunction = (objForSelect: Any, param: Any?, clauseResult: Any?) -> Any?
-@InternalCoroutinesApi
-public typealias OnCompleteAction = () -> Unit
 
 /**
  * Internal representation of select instance.
@@ -189,11 +185,28 @@ public interface SelectInstance<in R> {
     public fun selectInRegPhase(selectResult: Any?)
 }
 
-
 @PublishedApi
-internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
+internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R> {
     private val cont = atomic<Any?>(null)
     internal lateinit var context: CoroutineContext
+
+    /**
+     * The `select` operation is split into three phases: registration, waiting, and clean-up.
+     *
+     * == Phase 1: Registration ==
+     * In the first, registration phase, [SelectBuilder] is applied, and all the clauses register
+     * via the provided [registration function][SelectClause.regFunc]. Intuitively, `select` registration
+     * is similar to the plain blocking operation, with the only difference that this [SelectInstance]
+     * is stored instead of continuation, and [SelectInstance.trySelect] is used to make a rendezvous.
+     * Also, when registering, it is possible for the operation to complete immediately, without waiting.
+     * In the latter case, [SelectInstance.selectInRegPhase] should be used. Otherwise, a cancellation
+     * handler should be specified via [SelectInstance.invokeOnCompletion].
+     *
+     * After the [SelectBuilder] is processed, the registration completes s
+     *
+     *
+     *
+     */
 
     // 0: objForSelect
     // 1: RegistrationFunction
@@ -205,15 +218,7 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
     private var onCompleteAction: (() -> Unit)? = null
 
     private val state = atomic<Any>(STATE_REG)
-    private val clauseResult = atomic<Any?>(RESULT_NULL)
-
-    override fun invokeOnCompletion(onCompleteAction: () -> Unit) {
-        this.onCompleteAction = onCompleteAction
-    }
-
-    override fun selectInRegPhase(selectResult: Any?) {
-        this.clauseResult.value = selectResult
-    }
+    private val clauseResult = atomic<Any?>(NO_RESULT)
 
     suspend fun prepare() {
         this.context = coroutineContext
@@ -222,18 +227,20 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
     open suspend fun doSelect(): R =
         selectAlternativeIteration(cleanOnCompletion = true)
 
-    suspend fun selectAlternativeIteration(cleanOnCompletion: Boolean): R {
+
+
+    private suspend fun selectAlternativeIteration(cleanOnCompletion: Boolean): R {
         if (trySelectAlternative()) {
             val block = this.block!!
             if (cleanOnCompletion) {
-                cleanNonSelectedAlternatives(getObjForSelect())
+                cleanNonSelectedAlternatives(state.value)
                 cleanBuilder()
             }
             return if (block is suspend () -> R) {
                 block()
             } else {
                 block as suspend (Any?) -> R
-                block(clauseResult.value.also { clauseResult.lazySet(RESULT_NULL) })
+                block(clauseResult.value.also { clauseResult.lazySet(NO_RESULT) })
             }
         } else {
             return selectAlternativeIterationSuspend(cleanOnCompletion)
@@ -242,7 +249,7 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
 
     private suspend fun selectAlternativeIterationSuspend(cleanOnCompletion: Boolean): R {
         selectAlternativeSuspend()
-        val objForSelect = getObjForSelect()
+        val objForSelect = state.value
         val i = selectedAlternativeIndex(objForSelect)
         val result = processResult(i)
         val param = alternatives[i + 3]
@@ -266,42 +273,12 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
         throw recoverStackTrace(e)
     }
 
-    private fun cleanBuilder() {
-        this.alternatives.clear()
-        this.cont.value = null
-        this.block = null
-    }
-
     private fun processResult(i: Int): Any? {
         val objForSelect = alternatives[i]!!
         val processResFunc = alternatives[i + 2] as ProcessResultFunction
         val param = alternatives[i + 3]
-        val clauseResult = this.clauseResult.value.also { this.clauseResult.lazySet(RESULT_NULL) }
+        val clauseResult = this.clauseResult.value.also { this.clauseResult.lazySet(NO_RESULT) }
         return processResFunc(objForSelect, param, clauseResult)
-    }
-
-    private fun addAlternative(
-        objForSelect: Any,
-        regFunc: RegistrationFunction,
-        processResFunc: ProcessResultFunction,
-        param: Any?,
-        block: Any
-    ): Boolean {
-        if (clauseResult.value !== RESULT_NULL) return true
-        checkObjForSelect(objForSelect)
-        regFunc(objForSelect, this, param)
-        if (clauseResult.value === RESULT_NULL) { // registered as waiter
-            alternatives.add(objForSelect)
-            alternatives.add(regFunc)
-            alternatives.add(processResFunc)
-            alternatives.add(param)
-            alternatives.add(block)
-            alternatives.add(onCompleteAction.also { onCompleteAction = null })
-            return true
-        } else { // rendezvous?
-            storeObjForSelect(objForSelect)
-            return false
-        }
     }
 
     private fun checkObjForSelect(objForSelect: Any) {
@@ -317,17 +294,17 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
         val regFunc = alternatives[i + 1] as RegistrationFunction
         val param = alternatives[i + 3]
         regFunc(objForSelect, this, param)
-        return if (clauseResult.value === RESULT_NULL) { // registered as waiter
+        return if (clauseResult.value === NO_RESULT) { // registered as waiter
             alternatives[i + 5] = onCompleteAction.also { onCompleteAction = null }
             true
         } else { // rendezvous?
-            storeObjForSelect(objForSelect)
+            moveStateToDone(objForSelect)
             false
         }
     }
 
     private fun trySelectAlternative(): Boolean {
-        if (clauseResult.value !== RESULT_NULL) return true
+        if (clauseResult.value !== NO_RESULT) return true
         while (true) {
             val objForSelect = extractFromStackOrMarkWaiting() ?: break
             val i = selectedAlternativeIndex(objForSelect)
@@ -343,29 +320,6 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
     private suspend fun selectAlternativeSuspend() = suspendCancellableCoroutineReusable<Unit> { cont ->
         if (!this.cont.compareAndSet(null, cont)) cont.resume(Unit)
         cont.invokeOnCancellation { cleanNonSelectedAlternatives(null) }
-    }
-
-    /**
-     * This function removes this `SelectInstance` from the
-     * waiting queues of other alternatives.
-     */
-    fun cleanNonSelectedAlternatives(selectedObject: Any?) {
-        val curState = state.getAndSet(STATE_DONE)
-        clean@ for (i in 0 until alternatives.size / ALTERNATIVE_SIZE) {
-            val i = i * ALTERNATIVE_SIZE
-            val objForSelect = alternatives[i]
-            if (selectedObject === objForSelect) continue
-            var cur: Any = curState
-            check@ while (true) {
-                if (cur === objForSelect) continue@clean
-                if (cur !is Node) break@check
-                if (cur.objForSelect === objForSelect) continue@clean
-                if (cur.next == null) break@check
-                cur = cur.next!!
-            }
-            val onCompleteAction = alternatives[i + 5] as OnCompleteAction?
-            onCompleteAction?.invoke()
-        }
     }
 
     /**
@@ -394,26 +348,78 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
         error("Object for select $objForSelect is not found")
     }
 
-    override fun trySelect(objForSelect: Any, result: Any?): Boolean {
-        if (!tryRendezvousOrReregister(objForSelect)) return false
-        this.clauseResult.value = result
-        if (this.cont.value === null && this.cont.compareAndSet(null, STATE_DONE)) return true
-        this.cont.value!!.let { cont ->
-            cont as CancellableContinuation<Unit>
-            val resumeToken = cont.tryResume(Unit) ?: return false
-            cont.completeResume(resumeToken)
-            return true
+    private fun moveStateToDone(objForSelect: Any) {
+        // Replace the state with DONE.
+        // It is possible that there were clauses
+        // to re-register -- we simply ignore them.
+        state.value = objForSelect
+    }
+
+    private class Node(var objForSelect: Any?, var next: Node?)
+    private var block: Function<R>? = null
+
+    // == Phase 1: Registration ==
+
+    override fun SelectClause0.invoke(block: suspend () -> R) = register(block)
+    override fun <P, Q> SelectClause2<P, Q>.invoke(param: P, block: suspend (Q) -> R) = register(param, block)
+    override fun <Q> SelectClause1<Q>.invoke(block: suspend (Q) -> R) = register(block)
+
+    protected fun SelectClause0.register(block: suspend () -> R) {
+        if (!addAlternative(objForSelect, regFunc, processResFunc, PARAM_CLAUSE_0, block)) {
+            clauseResult.value = processResFunc(objForSelect, null, clauseResult.value)
+            this@SelectImplementation.block = block
         }
     }
 
-    private fun tryRendezvousOrReregister(objForSelect: Any): Boolean = state.loop { curState ->
-        when {
-            curState === STATE_REG -> if (state.compareAndSet(curState, Node(objForSelect, null))) return false
-            curState === STATE_WAITING -> if (state.compareAndSet(curState, objForSelect)) return true
-            curState === STATE_DONE -> return false
-            else -> if (state.compareAndSet(curState, Node(objForSelect, curState))) return false
+    protected fun <Q> SelectClause1<Q>.register(block: suspend (Q) -> R) {
+        if (!addAlternative(objForSelect, regFunc, processResFunc, PARAM_CLAUSE_1, block)) {
+            clauseResult.value = processResFunc(objForSelect, null, clauseResult.value)
+            this@SelectImplementation.block = block
         }
     }
+
+    protected fun <P, Q> SelectClause2<P, Q>.register(param: P, block: suspend (Q) -> R) {
+        if (!addAlternative(objForSelect, regFunc, processResFunc, param, block)) {
+            clauseResult.value = processResFunc(objForSelect, param, clauseResult.value)
+            this@SelectImplementation.block = block
+        }
+    }
+
+    private fun addAlternative(
+        objForSelect: Any,
+        regFunc: RegistrationFunction,
+        processResFunc: ProcessResultFunction,
+        param: Any?,
+        block: Any
+    ): Boolean {
+        if (clauseResult.value !== NO_RESULT) return true
+        checkObjForSelect(objForSelect)
+        regFunc(objForSelect, this, param)
+        if (clauseResult.value === NO_RESULT) { // registered as waiter
+            alternatives.run {
+                add(objForSelect)
+                add(regFunc)
+                add(processResFunc)
+                add(param)
+                add(block)
+                add(onCompleteAction.also { onCompleteAction = null })
+            }
+            return true
+        } else { // rendezvous?
+            moveStateToDone(objForSelect)
+            return false
+        }
+    }
+
+    override fun invokeOnCompletion(onCompleteAction: () -> Unit) {
+        this.onCompleteAction = onCompleteAction
+    }
+
+    override fun selectInRegPhase(selectResult: Any?) {
+        this.clauseResult.value = selectResult
+    }
+
+    // == Phase 2: Waiting ==
 
     private fun extractFromStackOrMarkWaiting(): Any? = state.loop { curState ->
         when {
@@ -426,95 +432,74 @@ internal open class SelectBuilderImpl<R> : SelectBuilder<R>, SelectInstance<R> {
         }
     }
 
-    private fun getObjForSelect(): Any {
-        var cur: Any = state.value
-        while (cur is Node) cur = cur.next!!
-        return cur
-    }
+    // == Phase 3: Clean-Up ==
 
-    private fun storeObjForSelect(objForSelect: Any): Unit = state.loop { curState ->
-        when {
-            curState === STATE_REG -> if (state.compareAndSet(STATE_REG, objForSelect)) return
-            curState is Node -> {
-                var lastNode: Node = curState
-                while (lastNode.next != null) lastNode = lastNode.next as Node
-                lastNode.next = objForSelect
-                return
+    /**
+     * This function removes this `SelectInstance` from the
+     * waiting queues of other alternatives.
+     */
+    private fun cleanNonSelectedAlternatives(selectedObject: Any?) {
+        val curState = state.value // TODO: clean it up
+        clean@ for (i in 0 until alternatives.size / ALTERNATIVE_SIZE) {
+            val i = i * ALTERNATIVE_SIZE
+            val objForSelect = alternatives[i]
+            if (selectedObject === objForSelect) continue
+            var cur: Any = curState
+            check@ while (true) {
+                if (cur === objForSelect) continue@clean
+                if (cur !is Node) break@check
+                if (cur.objForSelect === objForSelect) continue@clean
+                if (cur.next == null) break@check
+                cur = cur.next!!
             }
-            else -> if (state.compareAndSet(curState, Node(curState, objForSelect))) return
+            val onCompleteAction = alternatives[i + 5] as OnCompleteAction?
+            onCompleteAction?.invoke()
         }
     }
 
-    private class Node(var objForSelect: Any?, var next: Any?)
+    private fun cleanBuilder() {
+        this.alternatives.clear()
+        this.cont.value = null
+        this.block = null
+    }
 
-    var block: Function<R>? = null
+    // == Rendezvous ==
 
-    override fun SelectClause0.invoke(block: suspend () -> R) =
-        register(block)
-
-    override fun <P, Q> SelectClause2<P, Q>.invoke(param: P, block: suspend (Q) -> R) =
-        register(param, block)
-
-    override fun <Q> SelectClause1<Q>.invoke(block: suspend (Q) -> R) =
-        register(block)
-
-    protected fun SelectClause0.register(block: suspend () -> R) {
-        if (!addAlternative(objForSelect, regFunc, processResFunc, PARAM_CLAUSE_0, block)) {
-            clauseResult.value = processResFunc(objForSelect, null, clauseResult.value)
-            this@SelectBuilderImpl.block = block
+    override fun trySelect(objForSelect: Any, result: Any?): Boolean {
+        if (!tryRendezvousOrReregister(objForSelect)) return false
+        this.clauseResult.value = result
+        if (this.cont.value === null && this.cont.compareAndSet(null, CONT_RESUMED)) return true
+        this.cont.value!!.let { cont ->
+            cont as CancellableContinuation<Unit>
+            val resumeToken = cont.tryResume(Unit) ?: return false
+            cont.completeResume(resumeToken)
+            return true
         }
     }
 
-    protected fun <Q> SelectClause1<Q>.register(block: suspend (Q) -> R) {
-        if (!addAlternative(objForSelect, regFunc, processResFunc, PARAM_CLAUSE_1, block)) {
-            clauseResult.value = processResFunc(objForSelect, null, clauseResult.value)
-            this@SelectBuilderImpl.block = block
+    private fun tryRendezvousOrReregister(objForSelect: Any): Boolean = state.loop { curState ->
+        when {
+            curState === STATE_REG -> if (state.compareAndSet(curState, Node(objForSelect, null))) return false
+            curState === STATE_WAITING -> if (state.compareAndSet(curState, objForSelect)) return true
+            curState is Node -> if (state.compareAndSet(curState, Node(objForSelect, curState))) return false
+            else ->  return false // already selected
         }
     }
 
-    protected fun <P, Q> SelectClause2<P, Q>.register(param: P, block: suspend (Q) -> R) {
-        if (!addAlternative(objForSelect, regFunc, processResFunc, param, block)) {
-            clauseResult.value = processResFunc(objForSelect, param, clauseResult.value)
-            this@SelectBuilderImpl.block = block
-        }
-    }
-
-    override fun onTimeout(timeMillis: Long, block: suspend () -> R) =
-        OnTimeout(timeMillis).selectClause.invoke(block)
 }
 
-private class OnTimeout(
-    private val timeMillis: Long
-) {
-    private fun register(select: SelectInstance<*>, ignoredParam: Any?) {
-        if (timeMillis <= 0) {
-            select.selectInRegPhase(Unit)
-            return
-        }
-        val action = Runnable {
-            select.trySelect(this@OnTimeout, Unit)
-        }
-        select as SelectBuilderImpl<*>
-        val context = select.context
-        val disposableHandle = context.delay.invokeOnTimeout(timeMillis, action, context)
-        select.invokeOnCompletion { disposableHandle.dispose() }
-    }
-
-    val selectClause: SelectClause0 get() =
-        SelectClause0Impl(
-            objForSelect = this,
-            regFunc = OnTimeout::register as RegistrationFunction
-        )
-}
+@InternalCoroutinesApi
+public typealias OnCompleteAction = () -> Unit
 
 // Number of items to be stored for each alternative in the `alternatives` array.
 private const val ALTERNATIVE_SIZE = 6
 
 private val STATE_REG = Symbol("REG")
 private val STATE_WAITING = Symbol("WAITING")
-private val STATE_DONE = Symbol("DONE")
 
-private val RESULT_NULL = Symbol("NULL")
+private val CONT_RESUMED = Symbol("RESUMED")
+
+private val NO_RESULT = Symbol("NO_RESULT")
 
 internal val PARAM_CLAUSE_0 = Symbol("PARAM_CLAUSE_0")
 internal val PARAM_CLAUSE_1 = Symbol("PARAM_CLAUSE_1")

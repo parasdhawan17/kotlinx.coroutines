@@ -29,7 +29,7 @@ public suspend inline fun <R> selectUnbiased(crossinline builder: SelectBuilder<
 }
 
 @PublishedApi
-internal class UnbiasedSelectBuilderImpl<R> : SelectBuilderImpl<R>() {
+internal class UnbiasedSelectBuilderImpl<R> : SelectImplementation<R>() {
     private val clauses: MutableList<ClauseWithArguments> = arrayListOf()
 
     override fun SelectClause0.invoke(block: suspend () -> R) {
@@ -49,6 +49,7 @@ internal class UnbiasedSelectBuilderImpl<R> : SelectBuilderImpl<R>() {
         return super.doSelect()
     }
 
+    @Suppress("UNCHECKED_CAST")
     private fun shuffleAndRegisterClauses() {
         clauses.shuffle()
         clauses.forEach {
@@ -67,6 +68,6 @@ internal class UnbiasedSelectBuilderImpl<R> : SelectBuilderImpl<R>() {
         }
         clauses.clear()
     }
-}
 
-private class ClauseWithArguments(val clause: SelectClause, val param: Any?, val block: Any?)
+    private class ClauseWithArguments(val clause: SelectClause, val param: Any?, val block: Any?)
+}

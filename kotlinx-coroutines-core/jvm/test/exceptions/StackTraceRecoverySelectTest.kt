@@ -9,6 +9,7 @@ import kotlinx.coroutines.selects.*
 import org.junit.*
 import org.junit.rules.*
 
+// TODO: this test does not work, need to fix it
 class StackTraceRecoverySelectTest : TestBase() {
 
     @get:Rule
