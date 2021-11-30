@@ -560,7 +560,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     public final override val onJoin: SelectClause0
         get() = SelectClause0Impl(
-            objForSelect = this@JobSupport,
+            clauseObject = this@JobSupport,
             regFunc = JobSupport::registerSelectForOnJoin as RegistrationFunction
         )
 
@@ -1227,7 +1227,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
 
     internal val onAwaitInternal: SelectClause1<*> get() = SelectClause1Impl<Any?>(
-        objForSelect = this,
+        clauseObject = this,
         regFunc = JobSupport::onAwaitInternalRegFunc as RegistrationFunction,
         processResFunc = JobSupport::onAwaitInternalProcessResFunc as ProcessResultFunction
     )

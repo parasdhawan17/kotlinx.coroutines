@@ -35,7 +35,7 @@ private class OnTimeout(
 
     val selectClause: SelectClause0
         get() = SelectClause0Impl(
-            objForSelect = this@OnTimeout,
+            clauseObject = this@OnTimeout,
             regFunc = OnTimeout::register as RegistrationFunction
         )
 }

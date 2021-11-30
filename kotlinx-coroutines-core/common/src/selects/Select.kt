@@ -95,14 +95,16 @@ public interface SelectBuilder<in R> {
      * @param timeMillis timeout time in milliseconds.
      */
     @ExperimentalCoroutinesApi
-    @Deprecated(message = "Replaced with the same extension function",
-                level = DeprecationLevel.HIDDEN, replaceWith = ReplaceWith("onTimeout"))
+    @Deprecated(
+        message = "Replaced with the same extension function",
+        level = DeprecationLevel.HIDDEN, replaceWith = ReplaceWith("onTimeout")
+    )
     public fun onTimeout(timeMillis: Long, block: suspend () -> R): Unit = onTimeout(timeMillis, block)
 }
 
 /**
  * Each [select] clause should be provided with:
- * 1) the [object of this clause][objForSelect],
+ * 1) the [object of this clause][clauseObject],
  *    such as the channel instance for `onSend` and `onReceive`;
  * 2) the function that specifies how this clause
  *    should be registered in the object above ([regFunc]);
@@ -112,15 +114,15 @@ public interface SelectBuilder<in R> {
  */
 @InternalCoroutinesApi
 public sealed interface SelectClause {
-    public val objForSelect: Any
+    public val clauseObject: Any
     public val regFunc: RegistrationFunction
     public val processResFunc: ProcessResultFunction
 }
 
 @InternalCoroutinesApi
-public typealias RegistrationFunction = (objForSelect: Any, select: SelectInstance<*>, param: Any?) -> Unit
+public typealias RegistrationFunction = (clauseObject: Any, select: SelectInstance<*>, param: Any?) -> Unit
 @InternalCoroutinesApi
-public typealias ProcessResultFunction = (objForSelect: Any, param: Any?, clauseResult: Any?) -> Any?
+public typealias ProcessResultFunction = (clauseObject: Any, param: Any?, clauseResult: Any?) -> Any?
 
 /**
  * Clause for [select] expression without additional parameters that does not select any value.
@@ -129,11 +131,12 @@ public interface SelectClause0 : SelectClause
 
 @InternalCoroutinesApi
 public class SelectClause0Impl(
-    override val objForSelect: Any,
+    override val clauseObject: Any,
     override val regFunc: RegistrationFunction
-) :  SelectClause0 {
+) : SelectClause0 {
     override val processResFunc: ProcessResultFunction = DUMMY_PROCESS_RESULT_FUNCTION
 }
+
 private val DUMMY_PROCESS_RESULT_FUNCTION: ProcessResultFunction = { _, _, _ -> null }
 
 /**
@@ -143,7 +146,7 @@ public interface SelectClause1<out Q> : SelectClause
 
 @InternalCoroutinesApi
 public class SelectClause1Impl<Q>(
-    override val objForSelect: Any,
+    override val clauseObject: Any,
     override val regFunc: RegistrationFunction,
     override val processResFunc: ProcessResultFunction
 ) : SelectClause1<Q>
@@ -155,7 +158,7 @@ public interface SelectClause2<in P, out Q> : SelectClause
 
 @InternalCoroutinesApi
 public class SelectClause2Impl<P, Q>(
-    override val objForSelect: Any,
+    override val clauseObject: Any,
     override val regFunc: RegistrationFunction,
     override val processResFunc: ProcessResultFunction
 ) : SelectClause2<P, Q>
@@ -171,13 +174,13 @@ public interface SelectInstance<in R> {
      * This function should be called by other operations which are trying to perform a rendezvous with this `select`.
      * Returns `true` if the rendezvous succeeds, `false` otherwise.
      */
-    public fun trySelect(objForSelect: Any, result: Any?): Boolean
+    public fun trySelect(clauseObject: Any, result: Any?): Boolean
 
     /**
      * This function should be called when this `select` is registered as a waiter. A function which removes the waiter
      * after this `select` is processed should be provided as a parameter.
      */
-    public fun invokeOnCompletion(onCompleteAction: () -> Unit)
+    public fun invokeOnCompletion(onCompleteAction: OnCompleteAction)
 
     /**
      * This function should be called during this `select` registration phase on a successful rendezvous.
@@ -185,10 +188,17 @@ public interface SelectInstance<in R> {
     public fun selectInRegPhase(selectResult: Any?)
 }
 
+@InternalCoroutinesApi
+public typealias OnCompleteAction = () -> Unit
+
 @PublishedApi
 internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R> {
+    //
     private val cont = atomic<Any?>(null)
-    internal lateinit var context: CoroutineContext
+
+    // The context of the coroutine that performs this `select`.
+    private lateinit var _context: CoroutineContext
+    val context: CoroutineContext get() = _context
 
     /**
      * The `select` operation is split into three phases: registration, waiting, and clean-up.
@@ -208,155 +218,92 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
      *
      */
 
-    // 0: objForSelect
-    // 1: RegistrationFunction
-    // 2: ProcessResultFunction
-    // 3: param
-    // 4: block
-    // 5: onCompleteAction
-    private val alternatives = ArrayList<Any?>(ALTERNATIVE_SIZE * 2) // 2 clauses -- the most common case
+
+    private val clauses = ArrayList<ClauseData<R>>(2)
+    private val state = atomic<Any>(STATE_REG)
+
     private var onCompleteAction: (() -> Unit)? = null
 
-    private val state = atomic<Any>(STATE_REG)
-    private val clauseResult = atomic<Any?>(NO_RESULT)
+    private var clauseResult: Any? = NO_RESULT
 
     suspend fun prepare() {
-        this.context = coroutineContext
+        // We need to save the coroutine context for the `onTimeout` operator.
+        this._context = coroutineContext
     }
 
-    open suspend fun doSelect(): R =
-        selectAlternativeIteration(cleanOnCompletion = true)
-
-
-
-    private suspend fun selectAlternativeIteration(cleanOnCompletion: Boolean): R {
-        if (trySelectAlternative()) {
-            val block = this.block!!
-            if (cleanOnCompletion) {
-                cleanNonSelectedAlternatives(state.value)
-                cleanBuilder()
-            }
-            return if (block is suspend () -> R) {
-                block()
-            } else {
-                block as suspend (Any?) -> R
-                block(clauseResult.value.also { clauseResult.lazySet(NO_RESULT) })
-            }
-        } else {
-            return selectAlternativeIterationSuspend(cleanOnCompletion)
+    open suspend fun doSelect(): R {
+        // The clauses are already registered.
+        // Yet, there can be clauses to re-register stored
+        // in `state` field. Re-register them if required
+        // and move the state to WAITING.
+        if (reregisterAndMoveToWaiting()) {
+            suspendUntilSelected()
         }
+        val selectedClause = state.value as ClauseData<R>
+        val result = selectedClause.processResult(clauseResult)
+        cleanup(selectedClause)
+        return selectedClause.invokeBlock(result)
     }
 
-    private suspend fun selectAlternativeIterationSuspend(cleanOnCompletion: Boolean): R {
-        selectAlternativeSuspend()
-        val objForSelect = state.value
-        val i = selectedAlternativeIndex(objForSelect)
-        val result = processResult(i)
-        val param = alternatives[i + 3]
-        val block = alternatives[i + 4]
-        if (cleanOnCompletion) {
-            cleanNonSelectedAlternatives(objForSelect)
-            cleanBuilder()
-        }
-        return if (param === PARAM_CLAUSE_0) {
-            block as suspend () -> R
-            recoverStacktraceIfNeeded { block() }
-        } else {
-            block as suspend (Any?) -> R
-            recoverStacktraceIfNeeded { block(result) }
-        }
-    }
-
-    private inline fun <R> recoverStacktraceIfNeeded(block: () -> R): R = try {
-        block()
-    } catch (e: Throwable) {
-        throw recoverStackTrace(e)
-    }
-
-    private fun processResult(i: Int): Any? {
-        val objForSelect = alternatives[i]!!
-        val processResFunc = alternatives[i + 2] as ProcessResultFunction
-        val param = alternatives[i + 3]
-        val clauseResult = this.clauseResult.value.also { this.clauseResult.lazySet(NO_RESULT) }
-        return processResFunc(objForSelect, param, clauseResult)
-    }
-
-    private fun checkObjForSelect(objForSelect: Any) {
-        for (i in 0 until alternatives.size step ALTERNATIVE_SIZE) {
-            check(alternatives[i] !== objForSelect) {
-                "Cannot use matching select clauses on the same object"
+    private fun reregisterAndMoveToWaiting(): Boolean {
+        state.loop { curState ->
+            when {
+                curState === STATE_REG -> if (state.compareAndSet(curState, STATE_WAITING)) return true
+                curState is ClauseData<*> -> return false
+                curState is List<*> -> {
+                    curState as List<ClauseData<R>>
+                    curState.forEach { registerClause(it) }
+                }
+                else -> error("unexpected state: $curState")
             }
         }
-    }
-
-    private fun registerAlternative(i: Int): Boolean {
-        val objForSelect = alternatives[i]!!
-        val regFunc = alternatives[i + 1] as RegistrationFunction
-        val param = alternatives[i + 3]
-        regFunc(objForSelect, this, param)
-        return if (clauseResult.value === NO_RESULT) { // registered as waiter
-            alternatives[i + 5] = onCompleteAction.also { onCompleteAction = null }
-            true
-        } else { // rendezvous?
-            moveStateToDone(objForSelect)
-            false
-        }
-    }
-
-    private fun trySelectAlternative(): Boolean {
-        if (clauseResult.value !== NO_RESULT) return true
-        while (true) {
-            val objForSelect = extractFromStackOrMarkWaiting() ?: break
-            val i = selectedAlternativeIndex(objForSelect)
-            if (!registerAlternative(i)) {
-                this.clauseResult.value = processResult(i)
-                this.block = alternatives[i + 4] as Function<R>
-                return true
-            }
-        }
-        return false
-    }
-
-    private suspend fun selectAlternativeSuspend() = suspendCancellableCoroutineReusable<Unit> { cont ->
-        if (!this.cont.compareAndSet(null, cont)) cont.resume(Unit)
-        cont.invokeOnCancellation { cleanNonSelectedAlternatives(null) }
     }
 
     /**
-     * Gets the act function and the block for the selected alternative and invoke it
-     * with the specified result.
+     * Suspends until successful [tryResume] invocation is performed.
      */
-    private suspend fun <R> invokeSelectedAlternativeAction(i: Int, result: Any?): R {
-        val param = alternatives[i + 3]
-        val block = alternatives[i + 4]
-        return if (param === PARAM_CLAUSE_0) {
-            block as suspend () -> R
-            block()
-        } else {
-            block as suspend (Any?) -> R
-            block(result)
+    private suspend fun suspendUntilSelected() = suspendCancellableCoroutineReusable<Unit> { cont ->
+        // Try to store the continuation into `cont` field if it is not CONT_RESUMED.
+        // In the latter case, complete immediately.
+        if (!this.cont.compareAndSet(null, cont)) cont.resume(Unit)
+        // On cancellation, perform a cleanup to avoid memory leaks.
+        cont.invokeOnCancellation { cleanup() }
+    }
+
+    /**
+     * Resumes the suspended (or aimed at suspending) [doSelect] call.
+     * See [suspendUntilSelected] that also manipulates [cont].
+     */
+    private fun tryResume(): Boolean {
+        var cont = this.cont.value
+        // Does `cont` field stores a coroutine?
+        if (cont === null) {
+            // The field is still empty. Try to put CONT_RESUMED to inform `suspendUntilSelected`
+            // that it should not suspend, and complete immediately after that.
+            if (this.cont.compareAndSet(null, CONT_RESUMED)) return true
+            // The CONT_RESUMED installation has failed => a continuation is stored, read it.
+            cont = this.cont.value!!
         }
+        // Try to resume the continuation if it is not cancelled yet.
+        // Return `true` on success and `false` otherwise.
+        cont as CancellableContinuation<Unit>
+        val resumeToken = cont.tryResume(Unit) ?: return false
+        cont.completeResume(resumeToken)
+        return true
     }
 
     /**
      * Return an index of the selected alternative in `alternatives` array.
      */
-    private fun selectedAlternativeIndex(objForSelect: Any): Int {
-        for (i in 0 until alternatives.size step ALTERNATIVE_SIZE) {
-            if (alternatives[i] === objForSelect) return i
-        }
-        error("Object for select $objForSelect is not found")
-    }
+    private fun findClause(objForSelect: Any) =
+        clauses.find { it.clauseObject === objForSelect } ?: error("Clause with object $objForSelect is not found")
 
     private fun moveStateToDone(objForSelect: Any) {
         // Replace the state with DONE.
         // It is possible that there were clauses
         // to re-register -- we simply ignore them.
-        state.value = objForSelect
+        state.value = findClause(objForSelect)
     }
-
-    private class Node(var objForSelect: Any?, var next: Node?)
-    private var block: Function<R>? = null
 
     // == Phase 1: Registration ==
 
@@ -365,141 +312,134 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
     override fun <Q> SelectClause1<Q>.invoke(block: suspend (Q) -> R) = register(block)
 
     protected fun SelectClause0.register(block: suspend () -> R) {
-        if (!addAlternative(objForSelect, regFunc, processResFunc, PARAM_CLAUSE_0, block)) {
-            clauseResult.value = processResFunc(objForSelect, null, clauseResult.value)
-            this@SelectImplementation.block = block
-        }
+        val clause = ClauseData<R>(clauseObject, regFunc, processResFunc, PARAM_CLAUSE_0, block)
+        registerClause(clause)
     }
 
     protected fun <Q> SelectClause1<Q>.register(block: suspend (Q) -> R) {
-        if (!addAlternative(objForSelect, regFunc, processResFunc, PARAM_CLAUSE_1, block)) {
-            clauseResult.value = processResFunc(objForSelect, null, clauseResult.value)
-            this@SelectImplementation.block = block
-        }
+        val clause = ClauseData<R>(clauseObject, regFunc, processResFunc, PARAM_CLAUSE_1, block)
+        registerClause(clause)
     }
 
     protected fun <P, Q> SelectClause2<P, Q>.register(param: P, block: suspend (Q) -> R) {
-        if (!addAlternative(objForSelect, regFunc, processResFunc, param, block)) {
-            clauseResult.value = processResFunc(objForSelect, param, clauseResult.value)
-            this@SelectImplementation.block = block
+        val clause = ClauseData<R>(clauseObject, regFunc, processResFunc, param, block)
+        registerClause(clause)
+    }
+
+    private fun registerClause(clause: ClauseData<R>) {
+        if (state.value is ClauseData<*>) return
+        checkClauseObject(clause.clauseObject)
+        val registered = clause.register(this@SelectImplementation)
+        if (registered) {
+            clauses += clause
+            clause.onCompleteAction = onCompleteAction
+            onCompleteAction = null
+        } else {
+            state.value = clause
         }
     }
 
-    private fun addAlternative(
-        objForSelect: Any,
-        regFunc: RegistrationFunction,
-        processResFunc: ProcessResultFunction,
-        param: Any?,
-        block: Any
-    ): Boolean {
-        if (clauseResult.value !== NO_RESULT) return true
-        checkObjForSelect(objForSelect)
-        regFunc(objForSelect, this, param)
-        if (clauseResult.value === NO_RESULT) { // registered as waiter
-            alternatives.run {
-                add(objForSelect)
-                add(regFunc)
-                add(processResFunc)
-                add(param)
-                add(block)
-                add(onCompleteAction.also { onCompleteAction = null })
-            }
-            return true
-        } else { // rendezvous?
-            moveStateToDone(objForSelect)
-            return false
+    private fun checkClauseObject(clauseObject: Any) {
+        check(!clauses.any { it.clauseObject === clauseObject }) {
+            "Cannot use select clauses on the same object: $clauseObject"
         }
     }
 
-    override fun invokeOnCompletion(onCompleteAction: () -> Unit) {
+    override fun invokeOnCompletion(onCompleteAction: OnCompleteAction) {
         this.onCompleteAction = onCompleteAction
     }
 
     override fun selectInRegPhase(selectResult: Any?) {
-        this.clauseResult.value = selectResult
+        this.clauseResult = selectResult
     }
 
-    // == Phase 2: Waiting ==
-
-    private fun extractFromStackOrMarkWaiting(): Any? = state.loop { curState ->
-        when {
-            curState === STATE_REG -> if (state.compareAndSet(curState, STATE_WAITING)) return null
-            curState is Node -> {
-                val updState = curState.next ?: STATE_REG
-                if (state.compareAndSet(curState, updState)) return curState.objForSelect
-            }
-            else -> if (state.compareAndSet(curState, STATE_REG)) return curState
+    private fun cleanup(selectedClause: ClauseData<R>? = null) {
+        // Invoke all cancellation handlers except for the
+        // one related to the selected clause, if specified.
+        clauses.forEach { clause ->
+            if (clause !== selectedClause) clause.onCompleteAction?.invoke()
         }
-    }
-
-    // == Phase 3: Clean-Up ==
-
-    /**
-     * This function removes this `SelectInstance` from the
-     * waiting queues of other alternatives.
-     */
-    private fun cleanNonSelectedAlternatives(selectedObject: Any?) {
-        val curState = state.value // TODO: clean it up
-        clean@ for (i in 0 until alternatives.size / ALTERNATIVE_SIZE) {
-            val i = i * ALTERNATIVE_SIZE
-            val objForSelect = alternatives[i]
-            if (selectedObject === objForSelect) continue
-            var cur: Any = curState
-            check@ while (true) {
-                if (cur === objForSelect) continue@clean
-                if (cur !is Node) break@check
-                if (cur.objForSelect === objForSelect) continue@clean
-                if (cur.next == null) break@check
-                cur = cur.next!!
-            }
-            val onCompleteAction = alternatives[i + 5] as OnCompleteAction?
-            onCompleteAction?.invoke()
-        }
-    }
-
-    private fun cleanBuilder() {
-        this.alternatives.clear()
+        // Clear all the remaining data to avoid memory leaks.
+        this.clauses.clear()
         this.cont.value = null
-        this.block = null
+        this.clauseResult = null
     }
 
-    // == Rendezvous ==
-
-    override fun trySelect(objForSelect: Any, result: Any?): Boolean {
-        if (!tryRendezvousOrReregister(objForSelect)) return false
-        this.clauseResult.value = result
-        if (this.cont.value === null && this.cont.compareAndSet(null, CONT_RESUMED)) return true
-        this.cont.value!!.let { cont ->
-            cont as CancellableContinuation<Unit>
-            val resumeToken = cont.tryResume(Unit) ?: return false
-            cont.completeResume(resumeToken)
-            return true
+    override fun trySelect(clauseObject: Any, result: Any?): Boolean {
+        // Find the clause with the specified object.
+        val clause = findClause(clauseObject)
+        // Try to select this clause.
+        if (!trySelectClause(clause)) return false
+        // Success!
+        this.clauseResult = result
+        return tryResume().also { success ->
+            if (!success) this.clauseResult = NO_RESULT
         }
     }
 
-    private fun tryRendezvousOrReregister(objForSelect: Any): Boolean = state.loop { curState ->
+    private fun trySelectClause(clause: ClauseData<R>): Boolean = state.loop { curState ->
         when {
-            curState === STATE_REG -> if (state.compareAndSet(curState, Node(objForSelect, null))) return false
-            curState === STATE_WAITING -> if (state.compareAndSet(curState, objForSelect)) return true
-            curState is Node -> if (state.compareAndSet(curState, Node(objForSelect, curState))) return false
-            else ->  return false // already selected
+            // Perform a rendezvous with this select if it is in WAITING state.
+            curState === STATE_WAITING -> if (state.compareAndSet(curState, clause)) return true
+            // Already selected on the corresponding clause.
+            curState is ClauseData<*> -> return false
+            // This select is still in REGISTRATION phase, re-register the clause
+            // in order not to wait until this select moves to WAITING phase.
+            // This is a rare race, so we do not need to worry about performance here.
+            curState === STATE_REG -> if (state.compareAndSet(curState, listOf(clause))) return false
+            // This select is still in REGISTRATION phase, and the state stores a list of clauses
+            // for re-registration, add the selecting clause to this list.
+            // This is a rare race, so we do not need to worry about performance here.
+            curState is List<*> -> if (state.compareAndSet(curState, curState + clause)) return false
+            // Already selected with `objForSelect == curState`.
+            else -> error("Unexpected state: $curState")
         }
     }
 
+    private class ClauseData<R>(
+        val clauseObject: Any,
+        val regFunc: RegistrationFunction,
+        val processResFunc: ProcessResultFunction,
+        val param: Any?,
+        val block: Any,
+        var onCompleteAction: OnCompleteAction? = null
+    ) {
+        fun register(select: SelectImplementation<R>): Boolean {
+            assert { select.state.value === STATE_REG }
+            assert { select.clauseResult === NO_RESULT }
+            regFunc(clauseObject, select, param)
+            return select.clauseResult === NO_RESULT
+        }
+
+        fun processResult(result: Any?) = recoverStacktraceIfNeeded {
+            processResFunc(clauseObject, param, result)
+        }
+
+        suspend fun invokeBlock(result: Any?): R = recoverStacktraceIfNeeded {
+            val block = block
+            if (param === PARAM_CLAUSE_0) {
+                block as suspend () -> R
+                block()
+            } else {
+                block as suspend (Any?) -> R
+                block(result)
+            }
+        }
+    }
 }
 
-@InternalCoroutinesApi
-public typealias OnCompleteAction = () -> Unit
-
-// Number of items to be stored for each alternative in the `alternatives` array.
-private const val ALTERNATIVE_SIZE = 6
+private inline fun <R> recoverStacktraceIfNeeded(block: () -> R): R = try {
+    block()
+} catch (e: Throwable) {
+    throw recoverStackTrace(e)
+}
 
 private val STATE_REG = Symbol("REG")
 private val STATE_WAITING = Symbol("WAITING")
 
-private val CONT_RESUMED = Symbol("RESUMED")
+private val CONT_RESUMED = Symbol("CONT_RESUMED")
 
 private val NO_RESULT = Symbol("NO_RESULT")
 
-internal val PARAM_CLAUSE_0 = Symbol("PARAM_CLAUSE_0")
-internal val PARAM_CLAUSE_1 = Symbol("PARAM_CLAUSE_1")
+private val PARAM_CLAUSE_0 = Symbol("PARAM_CLAUSE_0")
+private val PARAM_CLAUSE_1 = Symbol("PARAM_CLAUSE_1")

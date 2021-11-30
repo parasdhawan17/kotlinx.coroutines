@@ -216,7 +216,7 @@ internal open class SemaphoreImpl(private val permits: Int, acquiredPermits: Int
     }
 
     val onAcquire: SelectClause1<Semaphore> get() = SelectClause1Impl(
-        objForSelect = this,
+        clauseObject = this,
         regFunc = SemaphoreImpl::onAcquireRegFunction as RegistrationFunction,
         processResFunc = SemaphoreImpl::onAcquireProcessResultFunction as ProcessResultFunction
     )

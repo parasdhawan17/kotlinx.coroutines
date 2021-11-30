@@ -21,7 +21,7 @@ public suspend inline fun <R> selectUnbiased(crossinline builder: SelectBuilder<
     contract {
         callsInPlace(builder, InvocationKind.EXACTLY_ONCE)
     }
-    return UnbiasedSelectBuilderImpl<R>().run {
+    return UnbiasedSelectImplementation<R>().run {
         prepare()
         builder(this)
         doSelect()
@@ -29,7 +29,7 @@ public suspend inline fun <R> selectUnbiased(crossinline builder: SelectBuilder<
 }
 
 @PublishedApi
-internal class UnbiasedSelectBuilderImpl<R> : SelectImplementation<R>() {
+internal class UnbiasedSelectImplementation<R> : SelectImplementation<R>() {
     private val clauses: MutableList<ClauseWithArguments> = arrayListOf()
 
     override fun SelectClause0.invoke(block: suspend () -> R) {
