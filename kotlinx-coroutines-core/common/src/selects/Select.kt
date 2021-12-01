@@ -54,8 +54,7 @@ public suspend inline fun <R> select(crossinline builder: SelectBuilder<R>.() ->
     contract {
         callsInPlace(builder, InvocationKind.EXACTLY_ONCE)
     }
-    return SelectImplementation<R>().run {
-        prepare()
+    return SelectImplementation<R>(coroutineContext).run {
         builder(this)
         doSelect()
     }
@@ -192,13 +191,12 @@ public interface SelectInstance<in R> {
 public typealias OnCompleteAction = () -> Unit
 
 @PublishedApi
-internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R> {
-    //
-    private val cont = atomic<Any?>(null)
-
-    // The context of the coroutine that performs this `select`.
-    private lateinit var _context: CoroutineContext
-    val context: CoroutineContext get() = _context
+internal open class SelectImplementation<R> constructor(
+    /**
+     * The context of the coroutine that is performing this `select` operation.
+     */
+    val context: CoroutineContext
+) : CancelHandler(), SelectBuilder<R>, SelectInstance<R> {
 
     /**
      * The `select` operation is split into three phases: registration, waiting, and clean-up.
@@ -218,78 +216,61 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
      *
      */
 
-
+    /**
+     * List of clauses waiting on this `select` instance.
+     */
     private val clauses = ArrayList<ClauseData<R>>(2)
+
+    /**
+     * The state of this `select` operation.
+     */
     private val state = atomic<Any>(STATE_REG)
+    /**
+     * Returns `true` if this `select` operation is logically in REGISTRATION state;
+     * otherwise, returns `false`.
+     */
+    private val inRegistrationState
+        get() = state.value.let {
+            it === STATE_REG || it is List<*>
+        }
 
-    private var onCompleteAction: (() -> Unit)? = null
+    /**
+     * Stores the completion action provided through [invokeOnCompletion] during clause registration.
+     * After that, if the clause is successfully registered (so, it has not completed immediately),
+     * this [OnCompleteAction] is stored into the corresponding [ClauseData] instance.
+     */
+    private var onCompleteAction: OnCompleteAction? = null
 
-    private var clauseResult: Any? = NO_RESULT
+    /**
+     * Stores the result passed via [selectInRegPhase] during clause registration
+     * or [trySelect], which is called by another coroutine trying to make a rendezvous
+     * with this `select` instance. Further, this result is processed via the
+     * [ProcessResultFunction] of the selected clause.
+     *
+     * Unfortunately, we cannot store the result in the [state] field, as the latter stores
+     * the clause object (see [ClauseData.clauseObject] and [SelectClause.clauseObject]).
+     * Instead, it is possible to merge the [result] and [onCompleteAction] fields into
+     * one that stores either result, if the clause is registered ([inRegistrationState] is `true`),
+     * or [OnCompleteAction] instance, if the clause is selected during registration ([inRegistrationState] is `false`).
+     * Yet, this optimization is omitted for simplicity.
+     */
+    private var result: Any? = NO_RESULT
 
-    suspend fun prepare() {
-        // We need to save the coroutine context for the `onTimeout` operator.
-        this._context = coroutineContext
+    @PublishedApi
+    internal open suspend fun doSelect(): R = if (isSelected) complete() else doSelectSuspend()
+
+    private suspend fun doSelectSuspend(): R {
+        waitUntilSelected()
+        return complete()
     }
 
-    open suspend fun doSelect(): R {
-        // The clauses are already registered.
-        // Yet, there can be clauses to re-register stored
-        // in `state` field. Re-register them if required
-        // and move the state to WAITING.
-        if (reregisterAndMoveToWaiting()) {
-            suspendUntilSelected()
-        }
+    private val isSelected get() = state.value is ClauseData<*>
+
+    private suspend fun complete(): R {
         val selectedClause = state.value as ClauseData<R>
-        val result = selectedClause.processResult(clauseResult)
+        val result = selectedClause.processResult(result)
         cleanup(selectedClause)
         return selectedClause.invokeBlock(result)
-    }
-
-    private fun reregisterAndMoveToWaiting(): Boolean {
-        state.loop { curState ->
-            when {
-                curState === STATE_REG -> if (state.compareAndSet(curState, STATE_WAITING)) return true
-                curState is ClauseData<*> -> return false
-                curState is List<*> -> {
-                    curState as List<ClauseData<R>>
-                    curState.forEach { registerClause(it) }
-                }
-                else -> error("unexpected state: $curState")
-            }
-        }
-    }
-
-    /**
-     * Suspends until successful [tryResume] invocation is performed.
-     */
-    private suspend fun suspendUntilSelected() = suspendCancellableCoroutineReusable<Unit> { cont ->
-        // Try to store the continuation into `cont` field if it is not CONT_RESUMED.
-        // In the latter case, complete immediately.
-        if (!this.cont.compareAndSet(null, cont)) cont.resume(Unit)
-        // On cancellation, perform a cleanup to avoid memory leaks.
-        cont.invokeOnCancellation { cleanup() }
-    }
-
-    /**
-     * Resumes the suspended (or aimed at suspending) [doSelect] call.
-     * See [suspendUntilSelected] that also manipulates [cont].
-     */
-    private fun tryResume(): Boolean {
-        var cont = this.cont.value
-        // Does `cont` field stores a coroutine?
-        if (cont === null) {
-            // The field is still empty. Try to put CONT_RESUMED to inform `suspendUntilSelected`
-            // that it should not suspend, and complete immediately after that.
-            if (this.cont.compareAndSet(null, CONT_RESUMED)) return true
-            // The CONT_RESUMED installation has failed => a continuation is stored, read it.
-            cont = this.cont.value!!
-        }
-        // Try to resume the continuation if it is not cancelled yet.
-        // Return `true` on success and `false` otherwise.
-        cont as CancellableContinuation<Unit>
-        val resumeToken = cont.tryResume(Unit) ?: return false
-        cont.completeResume(resumeToken)
-        return true
     }
 
     /**
@@ -297,15 +278,6 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
      */
     private fun findClause(objForSelect: Any) =
         clauses.find { it.clauseObject === objForSelect } ?: error("Clause with object $objForSelect is not found")
-
-    private fun moveStateToDone(objForSelect: Any) {
-        // Replace the state with DONE.
-        // It is possible that there were clauses
-        // to re-register -- we simply ignore them.
-        state.value = findClause(objForSelect)
-    }
-
-    // == Phase 1: Registration ==
 
     override fun SelectClause0.invoke(block: suspend () -> R) = register(block)
     override fun <P, Q> SelectClause2<P, Q>.invoke(param: P, block: suspend (Q) -> R) = register(param, block)
@@ -329,8 +301,7 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
     private fun registerClause(clause: ClauseData<R>) {
         if (state.value is ClauseData<*>) return
         checkClauseObject(clause.clauseObject)
-        val registered = clause.register(this@SelectImplementation)
-        if (registered) {
+        if (clause.tryRegister(this@SelectImplementation)) {
             clauses += clause
             clause.onCompleteAction = onCompleteAction
             onCompleteAction = null
@@ -350,7 +321,64 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
     }
 
     override fun selectInRegPhase(selectResult: Any?) {
-        this.clauseResult = selectResult
+        this.result = selectResult
+    }
+
+    private suspend fun waitUntilSelected() {
+        // Slow path: suspend and wait until selected.
+        return waitUntilSelectedSuspend()
+    }
+
+    private suspend fun waitUntilSelectedSuspend() = suspendCancellableCoroutineReusable<Unit> sc@ { cont ->
+        cont.invokeOnCancellation(this.asHandler)
+        state.loop { curState ->
+            when {
+                curState === STATE_REG -> if (state.compareAndSet(curState, cont)) return@sc
+                curState is ClauseData<*> -> {
+                    cont.resume(Unit)
+                    return@sc
+                }
+                curState is List<*> -> {
+                    curState as List<ClauseData<R>>
+                    curState.forEach { registerClause(it) }
+                }
+                else -> error("unexpected state: $curState")
+            }
+        }
+    }
+
+    override fun trySelect(clauseObject: Any, result: Any?): Boolean {
+        // Find the clause with the specified object.
+        val clause = findClause(clauseObject)
+        // Try to select this clause.
+        val cont = trySelectClause(clause) ?: return false
+        // Success!
+        this.result = result
+        return cont.tryResume().also { success ->
+            if (!success) this.result = NO_RESULT
+        }
+    }
+
+    private fun trySelectClause(clause: ClauseData<R>): CancellableContinuation<Unit>? = state.loop { curState ->
+        when(curState) {
+            // Perform a rendezvous with this select if it is in WAITING state.
+            is CancellableContinuation<*> -> {
+                if (state.compareAndSet(curState, clause)) return curState as CancellableContinuation<Unit>
+            }
+            // Already selected on the corresponding clause.
+            is ClauseData<*> -> return null
+            // Already selected and completed.
+            STATE_COMPLETED -> return null
+            // This select is still in REGISTRATION phase, re-register the clause
+            // in order not to wait until this select moves to WAITING phase.
+            // This is a rare race, so we do not need to worry about performance here.
+            STATE_REG -> if (state.compareAndSet(curState, listOf(clause))) return null
+            // This select is still in REGISTRATION phase, and the state stores a list of clauses
+            // for re-registration, add the selecting clause to this list.
+            // This is a rare race, so we do not need to worry about performance here.
+            is List<*> -> if (state.compareAndSet(curState, curState + clause)) return null
+            else -> error("Unexpected state: $curState")
+        }
     }
 
     private fun cleanup(selectedClause: ClauseData<R>? = null) {
@@ -360,42 +388,17 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
             if (clause !== selectedClause) clause.onCompleteAction?.invoke()
         }
         // Clear all the remaining data to avoid memory leaks.
-        this.clauses.clear()
-        this.cont.value = null
-        this.clauseResult = null
+        clauses.clear()
+        result = null
+        state.value = STATE_COMPLETED
     }
 
-    override fun trySelect(clauseObject: Any, result: Any?): Boolean {
-        // Find the clause with the specified object.
-        val clause = findClause(clauseObject)
-        // Try to select this clause.
-        if (!trySelectClause(clause)) return false
-        // Success!
-        this.clauseResult = result
-        return tryResume().also { success ->
-            if (!success) this.clauseResult = NO_RESULT
-        }
-    }
+    // [CompletionHandler] implementation
+    override fun invoke(cause: Throwable?) = cleanup()
 
-    private fun trySelectClause(clause: ClauseData<R>): Boolean = state.loop { curState ->
-        when {
-            // Perform a rendezvous with this select if it is in WAITING state.
-            curState === STATE_WAITING -> if (state.compareAndSet(curState, clause)) return true
-            // Already selected on the corresponding clause.
-            curState is ClauseData<*> -> return false
-            // This select is still in REGISTRATION phase, re-register the clause
-            // in order not to wait until this select moves to WAITING phase.
-            // This is a rare race, so we do not need to worry about performance here.
-            curState === STATE_REG -> if (state.compareAndSet(curState, listOf(clause))) return false
-            // This select is still in REGISTRATION phase, and the state stores a list of clauses
-            // for re-registration, add the selecting clause to this list.
-            // This is a rare race, so we do not need to worry about performance here.
-            curState is List<*> -> if (state.compareAndSet(curState, curState + clause)) return false
-            // Already selected with `objForSelect == curState`.
-            else -> error("Unexpected state: $curState")
-        }
-    }
-
+    /**
+     * Each `select` clause is internally represented with a [ClauseData] instance.
+      */
     private class ClauseData<R>(
         val clauseObject: Any,
         val regFunc: RegistrationFunction,
@@ -404,20 +407,26 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
         val block: Any,
         var onCompleteAction: OnCompleteAction? = null
     ) {
-        fun register(select: SelectImplementation<R>): Boolean {
+        fun tryRegister(select: SelectImplementation<R>): Boolean {
+            // Invariant: the specified select is in REGISTRATION
+            // state and
             assert { select.state.value === STATE_REG }
-            assert { select.clauseResult === NO_RESULT }
+            assert { select.result === NO_RESULT }
+            // Invoke the registration function.
             regFunc(clauseObject, select, param)
-            return select.clauseResult === NO_RESULT
+            // Check whether the
+            return select.result === NO_RESULT
         }
 
-        fun processResult(result: Any?) = recoverStacktraceIfNeeded {
+        fun processResult(result: Any?) = try {
             processResFunc(clauseObject, param, result)
+        } catch (e: Throwable) {
+            throw recoverStackTrace(e)
         }
 
-        suspend fun invokeBlock(result: Any?): R = recoverStacktraceIfNeeded {
+        suspend fun invokeBlock(result: Any?): R {
             val block = block
-            if (param === PARAM_CLAUSE_0) {
+            return if (param === PARAM_CLAUSE_0) {
                 block as suspend () -> R
                 block()
             } else {
@@ -428,18 +437,19 @@ internal open class SelectImplementation<R> : SelectBuilder<R>, SelectInstance<R
     }
 }
 
-private inline fun <R> recoverStacktraceIfNeeded(block: () -> R): R = try {
-    block()
-} catch (e: Throwable) {
-    throw recoverStackTrace(e)
+private fun CancellableContinuation<Unit>.tryResume(): Boolean {
+    val token = tryResume(Unit) ?: return false
+    completeResume(token)
+    return true
 }
 
-private val STATE_REG = Symbol("REG")
-private val STATE_WAITING = Symbol("WAITING")
-
-private val CONT_RESUMED = Symbol("CONT_RESUMED")
-
+// Markers for REGISTRATION and COMPLETED states.
+private val STATE_REG = Symbol("STATE_REG")
+private val STATE_COMPLETED = Symbol("STATE_COMPLETED")
+// As the selection result is nullable, we use this special
+// marker for the absence of result.
 private val NO_RESULT = Symbol("NO_RESULT")
-
+// We use this marker parameter objects to distinguish
+// SelectClause[0,1,2] and invoke the `block` correctly.
 private val PARAM_CLAUSE_0 = Symbol("PARAM_CLAUSE_0")
 private val PARAM_CLAUSE_1 = Symbol("PARAM_CLAUSE_1")

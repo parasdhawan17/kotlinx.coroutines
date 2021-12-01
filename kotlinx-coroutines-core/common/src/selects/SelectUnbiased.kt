@@ -6,6 +6,7 @@
 package kotlinx.coroutines.selects
 
 import kotlin.contracts.*
+import kotlin.coroutines.*
 
 /**
  * Waits for the result of multiple suspending functions simultaneously like [select], but in an _unbiased_
@@ -21,15 +22,14 @@ public suspend inline fun <R> selectUnbiased(crossinline builder: SelectBuilder<
     contract {
         callsInPlace(builder, InvocationKind.EXACTLY_ONCE)
     }
-    return UnbiasedSelectImplementation<R>().run {
-        prepare()
+    return UnbiasedSelectImplementation<R>(coroutineContext).run {
         builder(this)
         doSelect()
     }
 }
 
 @PublishedApi
-internal class UnbiasedSelectImplementation<R> : SelectImplementation<R>() {
+internal class UnbiasedSelectImplementation<R>(context: CoroutineContext) : SelectImplementation<R>(context) {
     private val clauses: MutableList<ClauseWithArguments> = arrayListOf()
 
     override fun SelectClause0.invoke(block: suspend () -> R) {
@@ -44,6 +44,7 @@ internal class UnbiasedSelectImplementation<R> : SelectImplementation<R>() {
         clauses += ClauseWithArguments(this, param, block)
     }
 
+    @PublishedApi
     override suspend fun doSelect(): R {
         shuffleAndRegisterClauses()
         return super.doSelect()
