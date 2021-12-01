@@ -184,7 +184,7 @@ public interface SelectInstance<in R> {
     /**
      * This function should be called during this `select` registration phase on a successful rendezvous.
      */
-    public fun selectInRegPhase(selectResult: Any?)
+    public fun selectInRegistrationPhase(selectResult: Any?)
 }
 
 @InternalCoroutinesApi
@@ -207,7 +207,7 @@ internal open class SelectImplementation<R> constructor(
      * is similar to the plain blocking operation, with the only difference that this [SelectInstance]
      * is stored instead of continuation, and [SelectInstance.trySelect] is used to make a rendezvous.
      * Also, when registering, it is possible for the operation to complete immediately, without waiting.
-     * In the latter case, [SelectInstance.selectInRegPhase] should be used. Otherwise, a cancellation
+     * In the latter case, [SelectInstance.selectInRegistrationPhase] should be used. Otherwise, a cancellation
      * handler should be specified via [SelectInstance.invokeOnCompletion].
      *
      * After the [SelectBuilder] is processed, the registration completes s
@@ -217,22 +217,28 @@ internal open class SelectImplementation<R> constructor(
      */
 
     /**
-     * List of clauses waiting on this `select` instance.
-     */
-    private val clauses = ArrayList<ClauseData<R>>(2)
-
-    /**
-     * The state of this `select` operation.
+     * The state of this `select` operation. See the description above for details.
      */
     private val state = atomic<Any>(STATE_REG)
     /**
-     * Returns `true` if this `select` operation is logically in REGISTRATION state;
+     * Returns `true` if this `select` instance is in the registration phase;
      * otherwise, returns `false`.
      */
-    private val inRegistrationState
+    private val inRegistrationPhase
         get() = state.value.let {
             it === STATE_REG || it is List<*>
         }
+    /**
+     * Returns `true` if this `select` is already selected or cancelled;
+     * thus, other parties are bound to fail when making a rendezvous with it.
+     */
+    private val isSelected
+        get() = state.value is ClauseData<*>
+
+    /**
+     * List of clauses waiting on this `select` instance.
+     */
+    private val clauses = ArrayList<ClauseData<R>>(2)
 
     /**
      * Stores the completion action provided through [invokeOnCompletion] during clause registration.
@@ -242,20 +248,27 @@ internal open class SelectImplementation<R> constructor(
     private var onCompleteAction: OnCompleteAction? = null
 
     /**
-     * Stores the result passed via [selectInRegPhase] during clause registration
+     * Stores the result passed via [selectInRegistrationPhase] during clause registration
      * or [trySelect], which is called by another coroutine trying to make a rendezvous
      * with this `select` instance. Further, this result is processed via the
      * [ProcessResultFunction] of the selected clause.
      *
      * Unfortunately, we cannot store the result in the [state] field, as the latter stores
-     * the clause object (see [ClauseData.clauseObject] and [SelectClause.clauseObject]).
+     * the clause object upon selection (see [ClauseData.clauseObject] and [SelectClause.clauseObject]).
      * Instead, it is possible to merge the [result] and [onCompleteAction] fields into
-     * one that stores either result, if the clause is registered ([inRegistrationState] is `true`),
-     * or [OnCompleteAction] instance, if the clause is selected during registration ([inRegistrationState] is `false`).
-     * Yet, this optimization is omitted for simplicity.
+     * one that stores either result when the clause is successfully registered ([inRegistrationPhase] is `true`),
+     * or [OnCompleteAction] instance when the clause is completed during registration ([inRegistrationPhase] is `false`).
+     * Yet, this optimization is omitted for code simplicity.
      */
     private var result: Any? = NO_RESULT
 
+    /**
+     * This function is called after the [SelectBuilder] is applied. In case one of the clauses is already selected,
+     * the algorithm applies the corresponding [ProcessResultFunction] and invokes the user-specified [block][ClauseData.block].
+     * Otherwise, it moves this `select` to WAITING phase (re-registering clauses if needed), suspends until a rendezvous
+     * is happened, and then completes the operation by applying the corresponding [ProcessResultFunction] and
+     * invoking the user-specified [block][ClauseData.block].
+     */
     @PublishedApi
     internal open suspend fun doSelect(): R = if (isSelected) complete() else doSelectSuspend()
 
@@ -263,8 +276,6 @@ internal open class SelectImplementation<R> constructor(
         waitUntilSelected()
         return complete()
     }
-
-    private val isSelected get() = state.value is ClauseData<*>
 
     private suspend fun complete(): R {
         val selectedClause = state.value as ClauseData<R>
@@ -320,16 +331,11 @@ internal open class SelectImplementation<R> constructor(
         this.onCompleteAction = onCompleteAction
     }
 
-    override fun selectInRegPhase(selectResult: Any?) {
+    override fun selectInRegistrationPhase(selectResult: Any?) {
         this.result = selectResult
     }
 
-    private suspend fun waitUntilSelected() {
-        // Slow path: suspend and wait until selected.
-        return waitUntilSelectedSuspend()
-    }
-
-    private suspend fun waitUntilSelectedSuspend() = suspendCancellableCoroutineReusable<Unit> sc@ { cont ->
+    private suspend fun waitUntilSelected() = suspendCancellableCoroutineReusable<Unit> sc@ { cont ->
         cont.invokeOnCancellation(this.asHandler)
         state.loop { curState ->
             when {
@@ -418,12 +424,22 @@ internal open class SelectImplementation<R> constructor(
             return select.result === NO_RESULT
         }
 
+        /**
+         * Processes the internal resumption result
+         * and returns a parameter for the user-specified
+         * block. Importantly, this call is eligible to fail,
+         * s
+         */
         fun processResult(result: Any?) = try {
             processResFunc(clauseObject, param, result)
         } catch (e: Throwable) {
             throw recoverStackTrace(e)
         }
 
+        /**
+         * Invokes the user-specified block with the
+         * corresponding result, already
+         */
         suspend fun invokeBlock(result: Any?): R {
             val block = block
             return if (param === PARAM_CLAUSE_0) {

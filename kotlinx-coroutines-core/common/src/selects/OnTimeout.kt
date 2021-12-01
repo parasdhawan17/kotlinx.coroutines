@@ -19,7 +19,7 @@ private class OnTimeout(
     private fun register(select: SelectInstance<*>, ignoredParam: Any?) {
         // Should this clause complete immediately?
         if (timeMillis <= 0) {
-            select.selectInRegPhase(Unit)
+            select.selectInRegistrationPhase(Unit)
             return
         }
         // Invoke `trySelect` after the timeout is reached.

@@ -225,7 +225,7 @@ internal open class SemaphoreImpl(private val permits: Int, acquiredPermits: Int
         acquire(
             waiter = select,
             suspend = { s -> addAcquireToQueue(s) },
-            onAcquired = { s -> s.selectInRegPhase(Unit) }
+            onAcquired = { s -> s.selectInRegistrationPhase(Unit) }
         )
 
     private fun onAcquireProcessResultFunction(param: Any?, result: Any?): Any? {
@@ -319,7 +319,7 @@ internal open class SemaphoreImpl(private val permits: Int, acquiredPermits: Int
                     waiter.resume(Unit, onCancellationRelease)
                 }
                 is SelectInstance<*> -> {
-                    waiter.selectInRegPhase(Unit)
+                    waiter.selectInRegistrationPhase(Unit)
                 }
                 else -> error("unexpected: $waiter")
             }

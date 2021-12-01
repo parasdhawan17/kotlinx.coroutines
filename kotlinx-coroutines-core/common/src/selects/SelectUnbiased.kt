@@ -29,7 +29,7 @@ public suspend inline fun <R> selectUnbiased(crossinline builder: SelectBuilder<
 }
 
 @PublishedApi
-internal class UnbiasedSelectImplementation<R>(context: CoroutineContext) : SelectImplementation<R>(context) {
+internal open class UnbiasedSelectImplementation<R>(context: CoroutineContext) : SelectImplementation<R>(context) {
     private val clauses: MutableList<ClauseWithArguments> = arrayListOf()
 
     override fun SelectClause0.invoke(block: suspend () -> R) {

@@ -9,7 +9,6 @@ import kotlinx.coroutines.selects.*
 import org.junit.*
 import org.junit.rules.*
 
-// TODO: this test does not work, need to fix it
 class StackTraceRecoverySelectTest : TestBase() {
 
     @get:Rule
@@ -28,7 +27,7 @@ class StackTraceRecoverySelectTest : TestBase() {
         val job = CompletableDeferred(Unit)
         return select {
             job.onJoin {
-                yield() // Hide the stackstrace
+                yield() // Hide the stacktrace
                 expect(2)
                 throw RecoverableTestException()
             }

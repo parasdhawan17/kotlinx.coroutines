@@ -566,7 +566,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
 
     private fun registerSelectForOnJoin(select: SelectInstance<*>, ignoredParam: Any?) {
         if (!joinInternal()) {
-            select.selectInRegPhase(Unit)
+            select.selectInRegistrationPhase(Unit)
             return
         }
         val disposableHandle = invokeOnCompletion { select.trySelect(this@JobSupport, Unit) }
@@ -1237,7 +1237,7 @@ public open class JobSupport constructor(active: Boolean) : Job, ChildJob, Paren
             val state = this.state
             if (state !is Incomplete) {
                 val result = if (state is CompletedExceptionally) state else state.unboxState()
-                select.selectInRegPhase(result)
+                select.selectInRegistrationPhase(result)
                 return
             }
             if (startInternal(state) >= 0) break // break unless needs to retry
