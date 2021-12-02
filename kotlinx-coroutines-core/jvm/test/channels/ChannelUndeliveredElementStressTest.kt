@@ -8,6 +8,7 @@ import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.selects.*
 import org.junit.After
+import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.*
 import org.junit.runners.*
@@ -18,6 +19,7 @@ import kotlin.test.*
  * Tests resource transfer via channel send & receive operations, including their select versions,
  * using `onUndeliveredElement` to detect lost resources and close them properly.
  */
+@Ignore // TODO: fix me!
 @RunWith(Parameterized::class)
 class ChannelUndeliveredElementStressTest(private val kind: TestChannelKind) : TestBase() {
     companion object {
