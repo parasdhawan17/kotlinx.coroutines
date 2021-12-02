@@ -28,6 +28,13 @@ public suspend inline fun <R> selectUnbiased(crossinline builder: SelectBuilder<
     }
 }
 
+/**
+ * The unbiased `select` inherits the [standard one][SelectImplementation],
+ * but does not register clauses immediately. Instead, it stores all of them
+ * in [clauses] lists, shuffles and registers them in the beginning of [doSelect]
+ * (see [shuffleAndRegisterClauses]), and then delegates the rest
+ * to the parent's [doSelect] implementation.
+ */
 @PublishedApi
 internal open class UnbiasedSelectImplementation<R>(context: CoroutineContext) : SelectImplementation<R>(context) {
     private val clauses: MutableList<ClauseWithArguments> = arrayListOf()
@@ -47,6 +54,7 @@ internal open class UnbiasedSelectImplementation<R>(context: CoroutineContext) :
     @PublishedApi
     override suspend fun doSelect(): R {
         shuffleAndRegisterClauses()
+        clauses.clear()
         return super.doSelect()
     }
 

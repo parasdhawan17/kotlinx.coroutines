@@ -8,10 +8,9 @@ import kotlinx.coroutines.*
 import kotlin.time.*
 
 /**
- * We implement [SelectBuilder.onTimeout] as a clause, with the only difference
- * that it requires access to the coroutine context to get a proper [Delay] instance.
- * Thus, we use an unchecked cast to [SelectImplementation] and storing the context
- * in the [corresponding field][SelectImplementation.context].
+ * We implement [SelectBuilder.onTimeout] as a clause, so each invocation creates
+ * an instance of [OnTimeout] that specifies the registration part according to
+ * the [timeout][timeMillis] parameter.
  */
 private class OnTimeout(
     private val timeMillis: Long
