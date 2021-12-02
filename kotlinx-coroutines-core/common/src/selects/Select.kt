@@ -187,7 +187,7 @@ public interface SelectInstance<in R> {
      * which are trying to perform a rendezvous with this `select`.
      * Returns `true` if the rendezvous succeeds, `false` otherwise.
      */
-    public fun trySelect(clauseObject: Any, result: Any?): Boolean
+    public fun trySelect(clauseObject: Any, result: Any?, onCancellation: ((Throwable) -> Unit)? = null): Boolean
 
     /**
      * Specifies how the stored as a waiter `select` instance should
@@ -280,7 +280,7 @@ internal open class SelectImplementation<R> constructor(
     /**
      * List of clauses waiting on this `select` instance.
      */
-    private val clauses = ArrayList<ClauseData<R>>(2)
+    private var clauses: MutableList<ClauseData<R>>? = ArrayList(2)
 
     /**
      * Stores the completion action provided through [invokeOnCompletion] during clause registration.
@@ -365,19 +365,19 @@ internal open class SelectImplementation<R> constructor(
      * provided via [selectInRegistrationPhase] -- the algorithm
      * updates the state to the specified [clause].
      */
-    private fun registerClause(clause: ClauseData<R>) {
+    private fun registerClause(clause: ClauseData<R>, reregister: Boolean = false) {
         // Is there already selected clause?
         if (state.value is ClauseData<*>) return
-        // Check that there does not exist another
-        // clause with the same object.
-        checkClauseObject(clause.clauseObject)
+        // For new clauses, check that there does not exist
+        // another clause with the same object.
+        if (!reregister) checkClauseObject(clause.clauseObject)
         // Try to register in the corresponding object.
         if (clause.tryRegister(this@SelectImplementation)) {
             // Successfully registered, and this `select` instance
             // is stored as a waiter. Add this clause to the list
             // of registered clauses and store the provided via
             // [invokeOnCompletion] completion action into the clause.
-            clauses += clause
+            if (!reregister) clauses!! += clause // TODO: comment
             clause.onCompleteAction = onCompleteAction
             onCompleteAction = null
         } else {
@@ -391,7 +391,7 @@ internal open class SelectImplementation<R> constructor(
      * Checks that there does not exist another clause with the same object.
      */
     private fun checkClauseObject(clauseObject: Any) {
-        check(!clauses.any { it.clauseObject === clauseObject }) {
+        check(!clauses!!.any { it.clauseObject === clauseObject }) {
             "Cannot use select clauses on the same object: $clauseObject"
         }
     }
@@ -427,8 +427,13 @@ internal open class SelectImplementation<R> constructor(
                 // This `select` is in REGISTRATION phase, but there are clauses that has to be registered again.
                 // Perform the required registrations and try again.
                 curState is List<*> -> if (state.compareAndSet(curState, STATE_REG)) {
-                    curState as List<ClauseData<R>>
-                    curState.forEach { registerClause(it) }
+                    curState as List<Any>
+                    curState.forEach { reregisterClause(it) }
+                }
+                // This `select` operation became completed during clauses re-registration.
+                curState is ClauseData<*> -> {
+                    cont.resume(Unit)
+                    return@sc
                 }
                 // This `select` cannot be in any other state.
                 else -> error("unexpected state: $curState")
@@ -438,19 +443,23 @@ internal open class SelectImplementation<R> constructor(
     // [CompletionHandler] implementation
     override fun invoke(cause: Throwable?) = cleanup()
 
+    private fun reregisterClause(clauseObject: Any) {
+        val clause = findClause(clauseObject)!!
+        clause.onCompleteAction = null
+        registerClause(clause, reregister = true)
+    }
+
     // ==============
     // = RENDEZVOUS =
     // ==============
 
-    override fun trySelect(clauseObject: Any, result: Any?): Boolean {
-        // Find the clause with the specified object.
-        val clause = findClause(clauseObject)
+    override fun trySelect(clauseObject: Any, result: Any?, onCancellation: ((Throwable) -> Unit)?): Boolean {
         // Try to select this clause.
-        val cont = trySelectClause(clause) ?: return false
+        val cont = trySelectClause(clauseObject) ?: return false
         // Success! Store the resumption value and
         // try to resume the continuation.
         this.result = result
-        val success = cont.tryResume()
+        val success = cont.tryResume(onCancellation)
         // If the resumption failed, we need to clean
         // the [result] field to avoid memory leaks.
         if (!success) this.result = null
@@ -460,19 +469,22 @@ internal open class SelectImplementation<R> constructor(
     /**
      * Finds the clause with the corresponding [clause object][SelectClause.clauseObject].
      */
-    private fun findClause(clauseObject: Any) =
-        clauses.find { it.clauseObject === clauseObject } ?: error("Clause with object $clauseObject is not found")
+    private fun findClause(clauseObject: Any) = clauses?.run {
+        find { it.clauseObject === clauseObject } ?: error("Clause with object $clauseObject is not found")
+    }
 
     /**
      * Tries to select the specified clause and returns the suspended coroutine on success.
      * On failure, when another clause is already selected or this `select` operation is cancelled,
      * this function returns `null`.
      */
-    private fun trySelectClause(clause: ClauseData<R>): CancellableContinuation<Unit>? =
-        state.loop { curState ->
-            when (curState) {
+    private fun trySelectClause(clauseObject: Any): CancellableContinuation<Unit>? {
+        var clause: ClauseData<R>? = null
+        while (true) {
+            when (val curState = state.value) {
                 // Perform a rendezvous with this select if it is in WAITING state.
                 is CancellableContinuation<*> -> {
+                    if (clause == null) clause = findClause(clauseObject) ?: return null
                     if (state.compareAndSet(curState, clause)) return curState as CancellableContinuation<Unit>
                 }
                 // Already selected on the `curState` clause.
@@ -482,21 +494,16 @@ internal open class SelectImplementation<R> constructor(
                 // This select is still in REGISTRATION phase, re-register the clause
                 // in order not to wait until this select moves to WAITING phase.
                 // This is a rare race, so we do not need to worry about performance here.
-                STATE_REG -> if (state.compareAndSet(curState, listOf(clause))) {
-                    clause.onCompleteAction = null // avoid memory leaks
-                    return null
-                }
+                STATE_REG -> if (state.compareAndSet(curState, listOf(clauseObject))) return null
                 // This select is still in REGISTRATION phase, and the state stores a list of clauses
                 // for re-registration, add the selecting clause to this list.
                 // This is a rare race, so we do not need to worry about performance here.
-                is List<*> -> if (state.compareAndSet(curState, curState + clause)) {
-                    clause.onCompleteAction = null // avoid memory leaks
-                    return null
-                }
+                is List<*> -> if (state.compareAndSet(curState, curState + clauseObject)) return null
                 // Another state? Something went really wrong.
                 else -> error("Unexpected state: $curState")
             }
         }
+    }
 
     // ==============
     // = COMPLETING =
@@ -534,11 +541,11 @@ internal open class SelectImplementation<R> constructor(
     private fun cleanup(selectedClause: ClauseData<R>? = null) {
         // Invoke all cancellation handlers except for the
         // one related to the selected clause, if specified.
-        clauses.forEach { clause ->
+        clauses!!.forEach { clause ->
             if (clause !== selectedClause) clause.onCompleteAction?.invoke()
         }
         // Clear all the remaining data to avoid memory leaks.
-        clauses.clear()
+        clauses = null
         result = null
         state.value = STATE_COMPLETED
     }
@@ -610,8 +617,8 @@ internal open class SelectImplementation<R> constructor(
     }
 }
 
-private fun CancellableContinuation<Unit>.tryResume(): Boolean {
-    val token = tryResume(Unit) ?: return false
+private fun CancellableContinuation<Unit>.tryResume(onCancellation: ((cause: Throwable) -> Unit)?): Boolean {
+    val token = tryResume(Unit, null, onCancellation) ?: return false
     completeResume(token)
     return true
 }

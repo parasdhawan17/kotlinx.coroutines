@@ -174,20 +174,39 @@ internal abstract class AbstractSendChannel<E>(
     }
 
     private suspend fun sendSuspend(element: E): Unit = suspendCancellableCoroutineReusable sc@ { cont ->
+        sendSlowPath(element, cont)
+    }
+
+    // waiter is either CancellableContinuation or SelectInstance
+    internal fun sendSlowPath(element: E, waiter: Any) {
         loop@ while (true) {
             if (isFullImpl) {
-                val send = if (onUndeliveredElement == null)
-                    SendElement(element, cont) else
-                    SendElementWithUndeliveredHandler(element, cont, onUndeliveredElement)
+                val send = if (waiter is SelectInstance<*>) {
+                    if (onUndeliveredElement == null) SendElementSelect(element, waiter, this)
+                    else SendElementSelectWithUndeliveredHandler(element, waiter, this, onUndeliveredElement)
+                } else {
+                    if (onUndeliveredElement == null) SendElement(element, waiter as CancellableContinuation<Unit>)
+                    else SendElementWithUndeliveredHandler(element, waiter as CancellableContinuation<Unit>, onUndeliveredElement)
+                }
                 val enqueueResult = enqueueSend(send)
                 when {
                     enqueueResult == null -> { // enqueued successfully
-                        cont.removeOnCancellation(send)
-                        return@sc
+                        if (waiter is SelectInstance<*>) {
+                            waiter.invokeOnCompletion { send.remove() }
+                        } else {
+                            waiter as CancellableContinuation<Unit>
+                            waiter.removeOnCancellation(send)
+                        }
+                        return
                     }
                     enqueueResult is Closed<*> -> {
-                        cont.helpCloseAndResumeWithSendException(element, enqueueResult)
-                        return@sc
+                        if (waiter is SelectInstance<*>) {
+                            waiter.helpCloseAndSelectInRegistrationPhaseClosed(element, enqueueResult)
+                        } else {
+                            waiter as CancellableContinuation<Unit>
+                            waiter.helpCloseAndResumeWithSendException(element, enqueueResult)
+                        }
+                        return
                     }
                     enqueueResult === ENQUEUE_FAILED -> {} // try to offer instead
                     enqueueResult is Receive<*> -> {} // try to offer instead
@@ -198,13 +217,23 @@ internal abstract class AbstractSendChannel<E>(
             val offerResult = offerInternal(element)
             when {
                 offerResult === OFFER_SUCCESS -> {
-                    cont.resume(Unit)
-                    return@sc
+                    if (waiter is SelectInstance<*>) {
+                        waiter.selectInRegistrationPhase(Unit)
+                    } else {
+                        waiter as CancellableContinuation<Unit>
+                        waiter.resume(Unit)
+                    }
+                    return
                 }
                 offerResult === OFFER_FAILED -> continue@loop
                 offerResult is Closed<*> -> {
-                    cont.helpCloseAndResumeWithSendException(element, offerResult)
-                    return@sc
+                    if (waiter is SelectInstance<*>) {
+                        waiter.helpCloseAndSelectInRegistrationPhaseClosed(element, offerResult)
+                    } else {
+                        waiter as CancellableContinuation<Unit>
+                        waiter.helpCloseAndResumeWithSendException(element, offerResult)
+                    }
+                    return
                 }
                 else -> error("offerInternal returned $offerResult")
             }
@@ -220,6 +249,17 @@ internal abstract class AbstractSendChannel<E>(
             return
         }
         resumeWithException(sendException)
+    }
+
+    private fun SelectInstance<*>.helpCloseAndSelectInRegistrationPhaseClosed(element: E, closed: Closed<*>) {
+        helpClose(closed)
+        val sendException = closed.sendException
+        onUndeliveredElement?.callUndeliveredElementCatchingException(element)?.let {
+            it.addSuppressed(sendException)
+            selectInRegistrationPhase(Closed<E>(it))
+            return
+        }
+        selectInRegistrationPhase(closed)
     }
 
     /**
@@ -343,10 +383,25 @@ internal abstract class AbstractSendChannel<E>(
     protected open fun takeFirstReceiveOrPeekClosed(): ReceiveOrClosed<E>? =
         queue.removeFirstIfIsInstanceOfOrPeekIf<ReceiveOrClosed<E>>({ it is Closed<*> })
 
-    // ------ registerSelectSend ------
+    final override val onSend
+        get() = SelectClause2Impl<E, SendChannel<E>>(
+            clauseObject = this,
+            regFunc = AbstractSendChannel<*>::registerSelectForSend as RegistrationFunction,
+            processResFunc = AbstractSendChannel<*>::processResultSelectSend as ProcessResultFunction
+        )
 
-    final override val onSend: SelectClause2<E, SendChannel<E>>
-        get() = TODO()
+    private fun registerSelectForSend(select: SelectInstance<*>, element: Any?) {
+        element as E
+        if (offerInternal(element) === OFFER_SUCCESS) {
+            select.selectInRegistrationPhase(Unit)
+            return
+        }
+        sendSlowPath(element, select)
+    }
+
+    private fun processResultSelectSend(ignoredParam: Any?, selectResult: Any?): Any? =
+        if (selectResult is Closed<*>) throw selectResult.sendException
+        else this
 
     // ------ debug ------
 
@@ -470,23 +525,49 @@ internal abstract class AbstractChannel<E>(
 
     @Suppress("UNCHECKED_CAST")
     private suspend fun <R> receiveSuspend(receiveMode: Int): R = suspendCancellableCoroutineReusable sc@ { cont ->
-        val receive = if (onUndeliveredElement == null)
-            ReceiveElement(cont as CancellableContinuation<Any?>, receiveMode) else
-            ReceiveElementWithUndeliveredHandler(cont as CancellableContinuation<Any?>, receiveMode, onUndeliveredElement)
+        receiveSlowPath(receiveMode, cont)
+    }
+
+    private fun receiveSlowPath(receiveMode: Int, waiter: Any) {
+        val receive = if (waiter is SelectInstance<*>) {
+            if (onUndeliveredElement == null) ReceiveElementSelect(waiter)
+            else ReceiveElementSelectWithUndeliveredHandler(waiter, onUndeliveredElement)
+        } else {
+            waiter as CancellableContinuation<Any?>
+            if (onUndeliveredElement == null) ReceiveElement(waiter, receiveMode)
+            else ReceiveElementWithUndeliveredHandler(waiter, receiveMode, onUndeliveredElement)
+        }
         while (true) {
             if (enqueueReceive(receive)) {
-                removeReceiveOnCancel(cont, receive)
-                return@sc
+                if (waiter is SelectInstance<*>) {
+                    waiter.invokeOnCompletion {
+                        if (receive.remove()) onReceiveDequeued()
+                    }
+                } else {
+                    waiter as CancellableContinuation<Any?>
+                    removeReceiveOnCancel(waiter, receive)
+                }
+                return
             }
             // hm... something is not right. try to poll
             val result = pollInternal()
             if (result is Closed<*>) {
-                receive.resumeReceiveClosed(result)
-                return@sc
+                if (waiter is SelectInstance<*>) {
+                    waiter.selectInRegistrationPhase(result)
+                } else { // CancellableContinuation
+                    receive.resumeReceiveClosed(result)
+                }
+                return
             }
             if (result !== POLL_FAILED) {
-                cont.resume(receive.resumeValue(result as E), receive.resumeOnCancellationFun(result as E))
-                return@sc
+                if (waiter is SelectInstance<*>) {
+                    waiter.selectInRegistrationPhase(result as E)
+                } else {
+                    waiter as CancellableContinuation<Any?>
+                    receive as ReceiveElement
+                    waiter.resume(receive.resumeValue(result as E), receive.resumeOnCancellationFun(result as E))
+                }
+                return
             }
         }
     }
@@ -605,11 +686,38 @@ internal abstract class AbstractChannel<E>(
         }
     }
 
-    final override val onReceive: SelectClause1<E>
-        get() = TODO()
+    // ------ the `select` expression support ------
 
-    final override val onReceiveCatching: SelectClause1<ChannelResult<E>>
-        get() = TODO()
+    final override val onReceive
+        get() = SelectClause1Impl<E>(
+            clauseObject = this,
+            regFunc = AbstractChannel<*>::registerSelectForReceive as RegistrationFunction,
+            processResFunc = AbstractChannel<*>::processResultSelectReceive as ProcessResultFunction
+        )
+
+    final override val onReceiveCatching
+        get() = SelectClause1Impl<ChannelResult<E>>(
+            clauseObject = this,
+            regFunc = AbstractChannel<*>::registerSelectForReceive as RegistrationFunction,
+            processResFunc = AbstractChannel<*>::processResultSelectReceiveCatching as ProcessResultFunction
+        )
+
+    private fun registerSelectForReceive(select: SelectInstance<*>, ignoredParam: Any?) {
+        val result = pollInternal()
+        if (result !== POLL_FAILED && result !is Closed<*>) {
+            select.selectInRegistrationPhase(result as E)
+            return
+        }
+        receiveSlowPath(RECEIVE_RESULT, select)
+    }
+
+    private fun processResultSelectReceive(ignoredParam: Any?, selectResult: Any?): Any? =
+        if (selectResult is Closed<*>) throw selectResult.receiveException
+        else selectResult as E
+
+    private fun processResultSelectReceiveCatching(ignoredParam: Any?, selectResult: Any?): Any? =
+        if (selectResult is Closed<*>) ChannelResult.closed(selectResult.closeCause)
+        else ChannelResult.success(selectResult as E)
 
     // ------ protected ------
 
@@ -739,6 +847,32 @@ internal abstract class AbstractChannel<E>(
             onUndeliveredElement.bindCancellationFun(value, cont.context)
     }
 
+    internal open inner class ReceiveElementSelect<in E>(
+        @JvmField val select: SelectInstance<*>,
+    ) : Receive<E>() {
+        private val lock = ReentrantLock()
+        private var success: Boolean? = null
+
+        override fun tryResumeReceive(value: E, otherOp: PrepareOp?): Symbol? = lock.withLock {
+            if (success == null) success = select.trySelect(this@AbstractChannel, value, resumeOnCancellationFun(value))
+            if (success!!) RESUME_TOKEN else null
+        }
+        override fun completeResumeReceive(value: E) {}
+
+        override fun resumeReceiveClosed(closed: Closed<*>) {
+            select.trySelect(this@AbstractChannel, closed)
+        }
+        override fun toString(): String = "ReceiveElementSelect@$hexAddress"
+    }
+
+    private open inner class ReceiveElementSelectWithUndeliveredHandler<in E>(
+        select: SelectInstance<*>,
+        @JvmField val onUndeliveredElement: OnUndeliveredElement<E>
+    ) : ReceiveElementSelect<E>(select) {
+        override fun resumeOnCancellationFun(value: E): ((Throwable) -> Unit)? =
+            onUndeliveredElement.bindCancellationFun(value, select.context)
+    }
+
     private open class ReceiveHasNext<E>(
         @JvmField val iterator: Itr<E>,
         @JvmField val cont: CancellableContinuation<Boolean>
@@ -858,6 +992,25 @@ internal open class SendElement<E>(
     override fun toString(): String = "$classSimpleName@$hexAddress($pollResult)"
 }
 
+internal open class SendElementSelect<E>(
+    override val pollResult: E,
+    @JvmField val select: SelectInstance<*>,
+    private val channel: SendChannel<E>
+) : Send() {
+    private val lock = ReentrantLock()
+    private var success: Boolean? = null
+
+    override fun tryResumeSend(otherOp: PrepareOp?): Symbol? = lock.withLock {
+        if (success == null) success = select.trySelect(channel, Unit)
+        if (success!!) RESUME_TOKEN else null
+    }
+    override fun completeResumeSend() {}
+    override fun resumeSendClosed(closed: Closed<*>) {
+        select.trySelect(channel, closed)
+    }
+    override fun toString(): String = "$classSimpleName@$hexAddress($pollResult)"
+}
+
 internal class SendElementWithUndeliveredHandler<E>(
     pollResult: E,
     cont: CancellableContinuation<Unit>,
@@ -875,6 +1028,23 @@ internal class SendElementWithUndeliveredHandler<E>(
     }
 }
 
+internal class SendElementSelectWithUndeliveredHandler<E>(
+    pollResult: E,
+    select: SelectInstance<*>,
+    channel: SendChannel<E>,
+    @JvmField val onUndeliveredElement: OnUndeliveredElement<E>
+) : SendElementSelect<E>(pollResult, select, channel) {
+    override fun remove(): Boolean {
+        if (!super.remove()) return false
+        // if the node was successfully removed (meaning it was added but was not received) then we have undelivered element
+        undeliveredElement()
+        return true
+    }
+
+    override fun undeliveredElement() {
+        onUndeliveredElement.callUndeliveredElement(pollResult, select.context)
+    }
+}
 /**
  * Represents closed channel.
  */

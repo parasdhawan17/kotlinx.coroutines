@@ -205,9 +205,9 @@ internal class MutexImpl(locked: Boolean) : SemaphoreImpl(1, if (locked) 1 else 
     private inner class SelectInstanceWithOwner<Q>(
         val select: SelectInstance<Q>,
         val owner: Any?
-    ) : SelectInstance<Q> by select {
-        override fun trySelect(clauseObject: Any, result: Any?): Boolean {
-            return select.trySelect(clauseObject, result).also { success ->
+    ) : SelectInstance<Q> by select, ((Throwable) -> Unit) {
+        override fun trySelect(clauseObject: Any, result: Any?, onCancellation: ((Throwable) -> Unit)?): Boolean {
+            return select.trySelect(clauseObject, result, this).also { success ->
                 if (success) this@MutexImpl.owner.value = owner
             }
         }
@@ -215,6 +215,11 @@ internal class MutexImpl(locked: Boolean) : SemaphoreImpl(1, if (locked) 1 else 
         override fun selectInRegistrationPhase(selectResult: Any?) {
             select.selectInRegistrationPhase(selectResult)
             this@MutexImpl.owner.value = owner
+        }
+
+        // [CompletionHandler] implementation
+        override fun invoke(cause: Throwable) {
+            unlock(owner)
         }
     }
 

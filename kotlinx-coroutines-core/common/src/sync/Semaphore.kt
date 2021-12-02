@@ -92,7 +92,7 @@ public suspend inline fun <T> Semaphore.withPermit(action: () -> T): T {
 }
 
 @Suppress("UNCHECKED_CAST")
-internal open class SemaphoreImpl(private val permits: Int, acquiredPermits: Int) : Semaphore {
+internal open class SemaphoreImpl(private val permits: Int, acquiredPermits: Int) : CompletionHandlerBase(), Semaphore {
     /*
        The queue of waiting acquirers is essentially an infinite array based on the list of segments
        (see `SemaphoreSegment`); each segment contains a fixed number of slots. To determine a slot for each enqueue
@@ -274,6 +274,11 @@ internal open class SemaphoreImpl(private val permits: Int, acquiredPermits: Int
         }
     }
 
+    // [CompletionHandler] implementation
+    override fun invoke(cause: Throwable?) {
+        release()
+    }
+
     /**
      * Changes the number of available permits to
      * [permits] if it became greater due to an
@@ -365,7 +370,7 @@ internal open class SemaphoreImpl(private val permits: Int, acquiredPermits: Int
             } else false
         }
         is SelectInstance<*> -> {
-            trySelect(this@SemaphoreImpl, Unit)
+            trySelect(this@SemaphoreImpl, Unit, this@SemaphoreImpl.asHandler)
         }
         else -> error("unexpected: $this")
     }

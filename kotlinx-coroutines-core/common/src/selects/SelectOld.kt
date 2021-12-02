@@ -25,7 +25,6 @@ internal class SelectBuilderImpl<R>(
 ) : SelectImplementation<R>(uCont.context) {
     private val cont = CancellableContinuationImpl(uCont.intercepted(), MODE_CANCELLABLE)
 
-    @OptIn(ExperimentalStdlibApi::class)
     @PublishedApi
     internal fun getResult(): Any? {
         // In the current `select` design, the [select] and [selectUnbiased] functions
@@ -40,17 +39,7 @@ internal class SelectBuilderImpl<R>(
         // 4) use CancellableContinuationImpl.getResult() as a result of this function.
         CoroutineScope(context).launch(start = CoroutineStart.UNDISPATCHED) {
             val result = doSelect()
-            // We have to avoid an extra dispatch when resuming the created
-            // CancellableContinuationImpl instance. The trick below with
-            // [resumeUndispatched] solves the issue.
-            with(cont) {
-                val dispatcher = context[CoroutineDispatcher]
-                if (dispatcher != null) {
-                    dispatcher.resumeUndispatched(result)
-                } else {
-                    resume(result)
-                }
-            }
+            cont.resumeUndispatched(result)
         }
         return cont.getResult()
     }
@@ -67,20 +56,12 @@ internal class UnbiasedSelectBuilderImpl<R>(
 ) : UnbiasedSelectImplementation<R>(uCont.context) {
     private val cont = CancellableContinuationImpl(uCont.intercepted(), MODE_CANCELLABLE)
 
-    @OptIn(ExperimentalStdlibApi::class)
     @PublishedApi
     internal fun initSelectResult(): Any? {
         // Here, we do the same trick as in [SelectBuilderImpl].
         CoroutineScope(context).launch(start = CoroutineStart.UNDISPATCHED) {
             val result = doSelect()
-            with(cont) {
-                val dispatcher = context[CoroutineDispatcher]
-                if (dispatcher != null) {
-                    dispatcher.resumeUndispatched(result)
-                } else {
-                    resume(result)
-                }
-            }
+            cont.resumeUndispatched(result)
         }
         return cont.getResult()
     }
@@ -115,3 +96,13 @@ internal suspend inline fun <R> selectUnbiasedOld(crossinline builder: SelectBui
         }
         scope.initSelectResult()
     }
+
+@OptIn(ExperimentalStdlibApi::class)
+private fun <T> CancellableContinuation<T>.resumeUndispatched(result: T) {
+    val dispatcher = context[CoroutineDispatcher]
+    if (dispatcher != null) {
+        dispatcher.resumeUndispatched(result)
+    } else {
+        resume(result)
+    }
+}
