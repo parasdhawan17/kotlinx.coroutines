@@ -12,6 +12,7 @@ import kotlinx.coroutines.internal.*
 import kotlinx.coroutines.sync.*
 import kotlin.contracts.*
 import kotlin.coroutines.*
+import kotlin.native.concurrent.*
 
 /**
  * Waits for the result of multiple suspending functions simultaneously, which are specified using _clauses_
@@ -624,12 +625,17 @@ private fun CancellableContinuation<Unit>.tryResume(onCancellation: ((cause: Thr
 }
 
 // Markers for REGISTRATION and COMPLETED states.
+@SharedImmutable
 private val STATE_REG = Symbol("STATE_REG")
+@SharedImmutable
 private val STATE_COMPLETED = Symbol("STATE_COMPLETED")
 // As the selection result is nullable, we use this special
 // marker for the absence of result.
+@SharedImmutable
 private val NO_RESULT = Symbol("NO_RESULT")
 // We use this marker parameter objects to distinguish
 // SelectClause[0,1,2] and invoke the `block` correctly.
+@SharedImmutable
 private val PARAM_CLAUSE_0 = Symbol("PARAM_CLAUSE_0")
+@SharedImmutable
 private val PARAM_CLAUSE_1 = Symbol("PARAM_CLAUSE_1")
