@@ -54,12 +54,11 @@ internal open class UnbiasedSelectImplementation<R>(context: CoroutineContext) :
     @PublishedApi
     override suspend fun doSelect(): R {
         shuffleAndRegisterClauses()
-        clauses.clear()
         return super.doSelect()
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun shuffleAndRegisterClauses() {
+    private fun shuffleAndRegisterClauses() = try {
         clauses.shuffle()
         clauses.forEach {
             when (val clause = it.clause) {
@@ -75,6 +74,7 @@ internal open class UnbiasedSelectImplementation<R>(context: CoroutineContext) :
                 }
             }
         }
+    } finally {
         clauses.clear()
     }
 
