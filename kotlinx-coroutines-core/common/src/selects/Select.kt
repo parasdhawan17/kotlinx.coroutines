@@ -145,6 +145,7 @@ public class SelectClause0Impl(
 ) : SelectClause0 {
     override val processResFunc: ProcessResultFunction = DUMMY_PROCESS_RESULT_FUNCTION
 }
+@SharedImmutable
 private val DUMMY_PROCESS_RESULT_FUNCTION: ProcessResultFunction = { _, _, _ -> null }
 
 /**
